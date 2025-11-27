@@ -51,15 +51,15 @@ class LLRPClient:
     # LLRP Version
     LLRP_VERSION = 1
     
-    def __init__(self, host: str, port: int = 5084, timeout: int = 30, setup_rospec: bool = False):
+    def __init__(self, host: str, port: int = 5084, timeout: int = 30, setup_rospec: bool = True):
         """
         Initialize LLRP client.
         
         Args:
             host: Zebra reader hostname or IP address
-            port: LLRP port (default: 5084)
+            port: LLRP port (default: 5084, use 5085 for secure/TLS)
             timeout: Connection timeout in seconds (default: 30)
-            setup_rospec: Whether to attempt ROSpec setup (default: False, reader may be pre-configured)
+            setup_rospec: Whether to attempt ROSpec setup (default: True, required for most readers)
         """
         self.host = host
         self.port = port
@@ -89,54 +89,78 @@ class LLRPClient:
             
             # Mark as connected
             self.connected = True
-            logger.info("Successfully connected to Zebra reader")
+            logger.info("TCP connection established to Zebra reader")
             
-            # Skip setup messages by default - many readers are pre-configured
-            # If setup is needed, it can be enabled via setup_rospec parameter
+            # Mandatory LLRP initialization sequence
+            # Zebra readers require proper LLRP session initialization or they close the connection
             if self.setup_rospec:
+                logger.info("Starting LLRP initialization sequence...")
+                
+                # Step 1: Send GET_READER_CAPABILITIES (mandatory initialization message)
                 try:
-                    # Send GET_READER_CAPABILITIES to initialize
-                    logger.debug("Sending GET_READER_CAPABILITIES...")
+                    logger.debug("Step 1: Sending GET_READER_CAPABILITIES...")
                     self._send_get_reader_capabilities()
                     
-                    # Wait and flush any responses
-                    time.sleep(0.3)
+                    # Wait for response and flush it
+                    time.sleep(0.5)
                     self._flush_pending_messages()
+                    
+                    if not self.connected:
+                        logger.error("Connection lost after GET_READER_CAPABILITIES")
+                        return False
                 except Exception as e:
-                    logger.warning(f"GET_READER_CAPABILITIES failed (may be normal): {e}")
-                    # Check if connection is still alive
+                    logger.error(f"GET_READER_CAPABILITIES failed: {e}")
                     if not self.connected:
                         return False
-            
-            # Configure ROSpec for tag reporting (optional - reader may already be configured)
-            if self.setup_rospec:
+                
+                # Step 2: Clear any existing ROSpecs
                 try:
-                    logger.debug("Setting up ROSpec...")
-                    self._setup_rospec()
-                    
-                    # Wait and flush any responses
+                    logger.debug("Step 2: Clearing existing ROSpecs...")
+                    self._clear_existing_rospecs()
                     time.sleep(0.3)
                     self._flush_pending_messages()
+                    
+                    if not self.connected:
+                        logger.error("Connection lost during ROSpec cleanup")
+                        return False
+                except Exception as e:
+                    logger.warning(f"Failed to clear ROSpecs: {e}")
+                    if not self.connected:
+                        return False
+                
+                # Step 3: Configure and start ROSpec
+                try:
+                    logger.debug("Step 3: Setting up ROSpec...")
+                    self._setup_rospec()
+                    
+                    # Wait for responses
+                    time.sleep(0.5)
+                    self._flush_pending_messages()
+                    
+                    if not self.connected:
+                        logger.error("Connection lost during ROSpec setup")
+                        return False
                 except ConnectionError:
-                    # Connection was lost during setup
                     logger.error("Connection lost during ROSpec setup")
                     return False
                 except Exception as e:
-                    logger.warning(f"ROSpec setup failed (reader may already be configured): {e}")
-                    # Check if connection is still alive
+                    logger.error(f"ROSpec setup failed: {e}")
                     if not self.connected:
-                        logger.error("Connection lost after ROSpec setup failure")
                         return False
-                    # Connection is still alive, continue anyway - reader might already be configured
+                    # Re-raise if connection is still alive but setup failed
+                    raise
+                
+                logger.info("LLRP initialization sequence completed successfully")
             else:
-                logger.info("Skipping ROSpec setup (reader should be pre-configured)")
+                logger.warning("Skipping LLRP setup - reader must be pre-configured")
+                logger.warning("Note: Most readers require explicit ROSpec setup or they will close the connection")
             
             # Verify connection is still active
             if not self.connected:
                 logger.error("Connection lost during setup")
                 return False
             
-            logger.info("Connection setup complete")
+            logger.info("LLRP session established and ready")
             return True
             
         except socket.timeout:
@@ -482,11 +506,49 @@ class LLRPClient:
         except Exception as e:
             logger.warning(f"Failed to send GET_READER_CAPABILITIES: {e}")
     
+    def _clear_existing_rospecs(self):
+        """
+        Clear any existing ROSpecs on the reader.
+        
+        This prevents conflicts when adding a new ROSpec.
+        """
+        try:
+            if not self.connected:
+                raise ConnectionError("Not connected")
+            
+            # Try to get existing ROSpecs first (optional - may fail if none exist)
+            try:
+                logger.debug("Checking for existing ROSpecs...")
+                self._send_message(self.MSG_GET_ROSPECS)
+                time.sleep(0.2)
+            except:
+                pass  # Ignore errors - reader may not have any ROSpecs
+            
+            # Delete ROSpec with ID 1 (the one we'll create)
+            # Note: This may fail if ROSpec 1 doesn't exist, which is fine
+            try:
+                logger.debug("Attempting to delete existing ROSpec ID 1...")
+                delete_body = struct.pack('>I', 1)  # ROSpec ID
+                self._send_message(self.MSG_DELETE_ROSPEC, delete_body)
+                time.sleep(0.2)
+            except Exception as e:
+                logger.debug(f"DELETE_ROSPEC may have failed (ROSpec may not exist): {e}")
+            
+        except Exception as e:
+            logger.warning(f"Error clearing ROSpecs: {e}")
+            # Don't raise - continue anyway
+    
     def _setup_rospec(self):
-        """Configure ROSpec for tag reporting."""
-        # This is a simplified ROSpec setup
-        # Note: Many readers are pre-configured and may not need this setup
-        # If setup fails, the reader may already be configured to send tag reports
+        """
+        Configure ROSpec for tag reporting.
+        
+        This method implements the mandatory LLRP sequence:
+        1. ADD_ROSPEC - Define the read operation specification
+        2. ENABLE_ROSPEC - Enable the ROSpec
+        3. START_ROSPEC - Start the read operation
+        
+        Most Zebra readers require this explicit setup or they will close the LLRP session.
+        """
         try:
             if not self.connected:
                 raise ConnectionError("Not connected")
