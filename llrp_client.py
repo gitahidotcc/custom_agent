@@ -91,6 +91,34 @@ class LLRPClient:
             self.connected = True
             logger.info("TCP connection established to Zebra reader")
             
+            # IMPORTANT: Check if reader sends any initial message first
+            # Some LLRP readers send a message immediately after connection
+            logger.debug("Checking for initial message from reader...")
+            time.sleep(0.1)
+            initial_msg, is_timeout = self._receive_bytes(12)
+            if initial_msg and len(initial_msg) >= 12:
+                logger.debug("Reader sent initial message - processing...")
+                # Try to read the full message
+                try:
+                    message_length = struct.unpack('>I', initial_msg[4:8])[0]
+                    if 12 <= message_length <= 65536:
+                        body_length = message_length - 12
+                        if body_length > 0:
+                            body, _ = self._receive_bytes(body_length)
+                            if body:
+                                full_msg = initial_msg + body
+                                message_type = int.from_bytes(initial_msg[1:4], byteorder='big')
+                                logger.info(f"Reader sent initial message type {message_type}")
+                                # Process the message (might be error or status)
+                                self._parse_message(full_msg)
+                except Exception as e:
+                    logger.debug(f"Could not parse initial message: {e}")
+                    # Continue anyway
+            elif not is_timeout:
+                logger.debug("No initial message from reader (connection may have closed)")
+                if not self.connected:
+                    return False
+            
             # Mandatory LLRP initialization sequence
             # Zebra readers require proper LLRP session initialization or they close the connection
             if self.setup_rospec:
@@ -99,6 +127,12 @@ class LLRPClient:
                 # Step 1: Send GET_READER_CAPABILITIES (mandatory initialization message)
                 try:
                     logger.debug("Step 1: Sending GET_READER_CAPABILITIES...")
+                    
+                    # Verify connection is still alive before sending
+                    if not self.connected:
+                        logger.error("Connection lost before sending GET_READER_CAPABILITIES")
+                        return False
+                    
                     self._send_get_reader_capabilities()
                     
                     # Wait for response and flush it
@@ -108,6 +142,24 @@ class LLRPClient:
                     if not self.connected:
                         logger.error("Connection lost after GET_READER_CAPABILITIES")
                         return False
+                except (ConnectionError, socket.error) as e:
+                    error_str = str(e)
+                    logger.error(f"GET_READER_CAPABILITIES failed - connection issue: {e}")
+                    if "Broken pipe" in error_str or "Connection reset" in error_str or "errno 32" in error_str:
+                        logger.error("=" * 60)
+                        logger.error("CRITICAL: Connection closed immediately by reader!")
+                        logger.error("Most likely causes:")
+                        logger.error("1. Another LLRP client is already connected to this reader")
+                        logger.error("   - Close Zebra's 123RFID Desktop application")
+                        logger.error("   - Close any other instances of this agent")
+                        logger.error("   - Check for other LLRP clients on the network")
+                        logger.error("2. Reader needs to be rebooted to clear stale sessions")
+                        logger.error("   - Go to: http://" + self.host + " > Shutdown > Restart Reader")
+                        logger.error("3. Reader's LLRP port may be in secure mode (use port 5085)")
+                        logger.error("=" * 60)
+                    else:
+                        logger.error("This usually means another LLRP client is connected or the reader rejected the session")
+                    return False
                 except Exception as e:
                     logger.error(f"GET_READER_CAPABILITIES failed: {e}")
                     if not self.connected:
@@ -369,6 +421,7 @@ class LLRPClient:
         
         return data, False
     
+    
     def _send_message(self, message_type: int, message_body: bytes = b'') -> int:
         """
         Send LLRP message to reader.
@@ -385,6 +438,14 @@ class LLRPClient:
         """
         if not self.socket or not self.connected:
             raise ConnectionError("Not connected to reader")
+        
+        # Double-check socket state before sending
+        try:
+            # Use getsockopt to check if socket is still connected
+            self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        except socket.error:
+            self.connected = False
+            raise ConnectionError("Socket connection lost")
         
         msg_id = self.message_id
         self.message_id += 1
@@ -407,8 +468,12 @@ class LLRPClient:
             self.connected = False
             raise ConnectionError("Connection timeout")
         except socket.error as e:
-            logger.error(f"Socket error sending message: {e}")
+            error_code = e.args[0] if e.args else None
+            error_str = str(e)
+            logger.error(f"Socket error sending message: {error_str} (code: {error_code})")
             self.connected = False
+            if error_code == 32 or "Broken pipe" in error_str or "Connection reset" in error_str:
+                raise ConnectionError("Connection closed by reader - likely another LLRP session is active")
             raise ConnectionError(f"Connection lost: {e}")
         except Exception as e:
             logger.error(f"Unexpected error sending message: {e}")
