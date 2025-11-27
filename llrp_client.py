@@ -86,8 +86,16 @@ class LLRPClient:
             # Send SET_READER_CONFIG to initialize
             self._send_get_reader_capabilities()
             
+            # Read any pending responses (wait a bit for reader to respond)
+            time.sleep(0.5)
+            self._flush_pending_messages()
+            
             # Configure ROSpec for tag reporting
             self._setup_rospec()
+            
+            # Flush any setup responses
+            time.sleep(0.5)
+            self._flush_pending_messages()
             
             return True
             
@@ -161,43 +169,60 @@ class LLRPClient:
         
         while self.connected:
             try:
-                # Read message length (first 4 bytes)
-                header = self._receive_bytes(4)
-                if not header:
+                # Read LLRP message header (12 bytes: version + type + length + id)
+                header = self._receive_bytes(12)
+                if not header or len(header) < 12:
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
                         self.connected = False
                         break
+                    if not header:
+                        continue
+                    logger.warning(f"Incomplete header received ({len(header)} bytes, expected 12)")
                     continue
                 
-                # Reset error counter on successful read
+                # Reset error counter on successful header read
                 consecutive_errors = 0
                 
-                if len(header) < 4:
-                    logger.warning(f"Incomplete header received ({len(header)} bytes)")
-                    continue
-                
-                message_length = struct.unpack('>I', header)[0]
+                # Parse header to get message length (bytes 4-8)
+                version = header[0] & 0x3F
+                message_type = int.from_bytes(header[1:4], byteorder='big')
+                message_length = struct.unpack('>I', header[4:8])[0]
+                message_id = struct.unpack('>I', header[8:12])[0]
                 
                 # Validate message length
                 if message_length < 12 or message_length > 65536:
-                    logger.warning(f"Invalid message length: {message_length}")
+                    logger.debug(f"Invalid message length: {message_length} (type: {message_type}, id: {message_id}). Attempting to resync...")
+                    # Try to resync by looking for a valid header pattern
+                    # Discard first byte and try again
+                    sync_byte = self._receive_bytes(1)
+                    if not sync_byte:
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
+                            self.connected = False
+                            break
                     continue
                 
-                # Read the rest of the message
-                message_data = self._receive_bytes(message_length - 4)
-                if not message_data or len(message_data) < (message_length - 4):
-                    logger.warning(f"Incomplete message received (expected {message_length - 4}, got {len(message_data) if message_data else 0})")
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
-                        self.connected = False
-                        break
-                    continue
+                # Read the rest of the message body (we already have 12 bytes of header)
+                body_length = message_length - 12
+                if body_length > 0:
+                    message_body = self._receive_bytes(body_length)
+                    if not message_body or len(message_body) < body_length:
+                        logger.warning(f"Incomplete message body (expected {body_length}, got {len(message_body) if message_body else 0})")
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
+                            self.connected = False
+                            break
+                        continue
+                    full_message = header + message_body
+                else:
+                    full_message = header
                 
-                # Parse message
-                self._parse_message(header + message_data)
+                # Parse and process the message
+                self._parse_message(full_message)
                 
             except socket.timeout:
                 # Timeout is expected, continue listening
@@ -300,7 +325,14 @@ class LLRPClient:
         
         body = data[12:] if len(data) > 12 else b''
         
-        logger.debug(f"Received LLRP message type {message_type}, ID {message_id}")
+        # Log all message types for debugging
+        if message_type == self.MSG_RO_ACCESS_REPORT:
+            logger.debug(f"Received RO_ACCESS_REPORT message, ID {message_id}")
+        elif message_type in [self.MSG_ADD_ROSPEC_RESPONSE, self.MSG_ENABLE_ROSPEC_RESPONSE, 
+                              self.MSG_START_ROSPEC_RESPONSE, self.MSG_GET_READER_CAPABILITIES_RESPONSE]:
+            logger.debug(f"Received response message type {message_type}, ID {message_id}")
+        else:
+            logger.debug(f"Received LLRP message type {message_type}, ID {message_id}")
         
         # Handle RO_ACCESS_REPORT (tag reports)
         if message_type == self.MSG_RO_ACCESS_REPORT:
@@ -428,6 +460,62 @@ class LLRPClient:
         
         param_length = 4 + len(roreportspec_body)
         return struct.pack('>HH', self.PARAM_RO_REPORT_SPEC, param_length) + roreportspec_body
+    
+    def _flush_pending_messages(self, timeout: float = 1.0):
+        """
+        Read and discard any pending messages in the socket buffer.
+        
+        This is useful after sending setup messages to clear response messages
+        before starting to listen for tag reports.
+        
+        Args:
+            timeout: Maximum time to spend flushing messages
+        """
+        if not self.socket:
+            return
+        
+        original_timeout = self.socket.gettimeout()
+        self.socket.settimeout(0.1)  # Short timeout for flushing
+        
+        end_time = time.time() + timeout
+        messages_read = 0
+        
+        try:
+            while time.time() < end_time:
+                try:
+                    # Try to read a header
+                    header = self._receive_bytes(12)
+                    if not header or len(header) < 12:
+                        break
+                    
+                    # Get message length
+                    message_length = struct.unpack('>I', header[4:8])[0]
+                    
+                    # Validate and read full message
+                    if 12 <= message_length <= 65536:
+                        body_length = message_length - 12
+                        if body_length > 0:
+                            body = self._receive_bytes(body_length)
+                            if not body or len(body) < body_length:
+                                break
+                        messages_read += 1
+                        
+                        # Parse and log the message type
+                        message_type = int.from_bytes(header[1:4], byteorder='big')
+                        logger.debug(f"Flushed pending message type {message_type}")
+                    else:
+                        # Invalid message, stop flushing
+                        break
+                except socket.timeout:
+                    break
+                except Exception as e:
+                    logger.debug(f"Error flushing message: {e}")
+                    break
+        finally:
+            self.socket.settimeout(original_timeout)
+        
+        if messages_read > 0:
+            logger.debug(f"Flushed {messages_read} pending message(s)")
     
     def _send_stop_rospec(self):
         """Stop and disable ROSpec."""
