@@ -659,7 +659,20 @@ class LLRPClient:
             self.connected = False
             return False
         elif status == self.CONN_FAILED_READER_INITIATED_NOT_SUPPORTED:
-            logger.error("CONNECTION REJECTED: Reader-initiated connection not supported")
+            logger.error("=" * 60)
+            logger.error("CONNECTION REJECTED: Reader does not accept client connections!")
+            logger.error("")
+            logger.error("The reader is configured in 'Reader-Initiated' mode, which means")
+            logger.error("it only makes outbound connections to a configured client IP.")
+            logger.error("")
+            logger.error("To fix this, reconfigure the reader:")
+            logger.error(f"1. Open: http://{self.host}")
+            logger.error("2. Go to: Communication > LLRP Settings")
+            logger.error("3. Change 'Connection Type' from 'Reader Initiated' to 'Client Initiated'")
+            logger.error("   (or 'Initiator: Reader' to 'Initiator: Client')")
+            logger.error("4. Save and apply the settings")
+            logger.error("5. Reboot the reader if required")
+            logger.error("=" * 60)
             self.connected = False
             return False
         else:
