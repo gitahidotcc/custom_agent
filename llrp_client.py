@@ -9,7 +9,7 @@ import socket
 import struct
 import logging
 import time
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -212,18 +212,32 @@ class LLRPClient:
         
         consecutive_errors = 0
         max_consecutive_errors = 10
+        timeout_count = 0
         
         while self.connected:
             try:
                 # Read LLRP message header (12 bytes: version + type + length + id)
-                header = self._receive_bytes(12)
+                header, is_timeout = self._receive_bytes(12)
+                
+                if is_timeout:
+                    # Timeout is normal when waiting for messages - don't count as error
+                    timeout_count += 1
+                    if timeout_count % 100 == 0:
+                        logger.debug(f"Still waiting for messages... ({timeout_count} timeouts)")
+                    continue
+                
+                # Reset timeout counter when we get data
+                timeout_count = 0
+                
                 if not header or len(header) < 12:
+                    # This is an actual error (not timeout)
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
                         logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
                         self.connected = False
                         break
                     if not header:
+                        logger.warning("Connection closed or error reading header")
                         continue
                     logger.warning(f"Incomplete header received ({len(header)} bytes, expected 12)")
                     continue
@@ -242,7 +256,9 @@ class LLRPClient:
                     logger.debug(f"Invalid message length: {message_length} (type: {message_type}, id: {message_id}). Attempting to resync...")
                     # Try to resync by looking for a valid header pattern
                     # Discard first byte and try again
-                    sync_byte = self._receive_bytes(1)
+                    sync_byte, is_timeout = self._receive_bytes(1)
+                    if is_timeout:
+                        continue  # Timeout is normal
                     if not sync_byte:
                         consecutive_errors += 1
                         if consecutive_errors >= max_consecutive_errors:
@@ -254,7 +270,15 @@ class LLRPClient:
                 # Read the rest of the message body (we already have 12 bytes of header)
                 body_length = message_length - 12
                 if body_length > 0:
-                    message_body = self._receive_bytes(body_length)
+                    message_body, is_timeout = self._receive_bytes(body_length)
+                    if is_timeout:
+                        logger.warning(f"Timeout reading message body (expected {body_length} bytes)")
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
+                            self.connected = False
+                            break
+                        continue
                     if not message_body or len(message_body) < body_length:
                         logger.warning(f"Incomplete message body (expected {body_length}, got {len(message_body) if message_body else 0})")
                         consecutive_errors += 1
@@ -271,7 +295,7 @@ class LLRPClient:
                 self._parse_message(full_message)
                 
             except socket.timeout:
-                # Timeout is expected, continue listening
+                # Timeout is expected when waiting for messages, continue listening
                 continue
             except socket.error as e:
                 logger.error(f"Socket error while listening: {e}")
@@ -294,24 +318,32 @@ class LLRPClient:
                     break
                 continue
     
-    def _receive_bytes(self, count: int) -> Optional[bytes]:
-        """Receive exact number of bytes from socket."""
+    def _receive_bytes(self, count: int) -> Tuple[Optional[bytes], bool]:
+        """
+        Receive exact number of bytes from socket.
+        
+        Returns:
+            Tuple of (data bytes, is_timeout)
+            - If data received: (bytes, False)
+            - If timeout: (None, True)
+            - If error: (None, False)
+        """
         if not self.socket:
-            return None
+            return None, False
         
         data = b''
         while len(data) < count:
             try:
                 chunk = self.socket.recv(count - len(data))
                 if not chunk:
-                    return None
+                    return None, False  # Connection closed
                 data += chunk
             except socket.timeout:
-                return None
+                return None, True  # Timeout (normal)
             except socket.error:
-                return None
+                return None, False  # Actual error
         
-        return data
+        return data, False
     
     def _send_message(self, message_type: int, message_body: bytes = b'') -> int:
         """
@@ -546,8 +578,8 @@ class LLRPClient:
             while time.time() < end_time:
                 try:
                     # Try to read a header
-                    header = self._receive_bytes(12)
-                    if not header or len(header) < 12:
+                    header, is_timeout = self._receive_bytes(12)
+                    if is_timeout or not header or len(header) < 12:
                         break
                     
                     # Get message length
@@ -557,8 +589,8 @@ class LLRPClient:
                     if 12 <= message_length <= 65536:
                         body_length = message_length - 12
                         if body_length > 0:
-                            body = self._receive_bytes(body_length)
-                            if not body or len(body) < body_length:
+                            body, is_timeout = self._receive_bytes(body_length)
+                            if is_timeout or not body or len(body) < body_length:
                                 break
                         messages_read += 1
                         
