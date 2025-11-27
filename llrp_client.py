@@ -1,8 +1,6 @@
 """
-LLRP (Low Level Reader Protocol) client for Zebra FX Series RFID readers.
-
-This module implements a client for connecting to Zebra RFID readers via LLRP
-protocol to receive real-time tag reports containing EPC IDs.
+Simple LLRP client for Zebra FX Series RFID readers.
+Connects and listens for tag reports - no complex setup.
 """
 
 import socket
@@ -15,252 +13,45 @@ logger = logging.getLogger(__name__)
 
 
 class LLRPClient:
-    """LLRP protocol client for Zebra RFID readers."""
+    """Simple LLRP client - connects and listens for tag events."""
     
     # LLRP Message Types
-    MSG_GET_READER_CAPABILITIES = 1
-    MSG_GET_READER_CONFIG = 2
-    MSG_SET_READER_CONFIG = 3
-    MSG_GET_READER_CAPABILITIES_RESPONSE = 11
-    MSG_GET_READER_CONFIG_RESPONSE = 12
-    MSG_SET_READER_CONFIG_RESPONSE = 13
-    MSG_ADD_ROSPEC = 20
-    MSG_DELETE_ROSPEC = 21
-    MSG_START_ROSPEC = 22
-    MSG_STOP_ROSPEC = 23
-    MSG_ENABLE_ROSPEC = 24
-    MSG_DISABLE_ROSPEC = 25
-    MSG_GET_ROSPECS = 26
-    MSG_ADD_ROSPEC_RESPONSE = 40
-    MSG_DELETE_ROSPEC_RESPONSE = 41
-    MSG_START_ROSPEC_RESPONSE = 42
-    MSG_STOP_ROSPEC_RESPONSE = 43
-    MSG_ENABLE_ROSPEC_RESPONSE = 44
-    MSG_DISABLE_ROSPEC_RESPONSE = 45
-    MSG_GET_ROSPECS_RESPONSE = 46
     MSG_RO_ACCESS_REPORT = 61
     MSG_READER_EVENT_NOTIFICATION = 63
-    MSG_CLOSE_CONNECTION = 14
-    MSG_CLOSE_CONNECTION_RESPONSE = 4
     
-    # Connection attempt status codes
-    CONN_SUCCESS = 0
-    CONN_FAILED_OTHER = 1
-    CONN_FAILED_READER_INITIATED_NOT_SUPPORTED = 2
-    CONN_FAILED_ANOTHER_CONNECTION_ATTEMPTED = 3
-    CONN_FAILED_READER_BUSY = 4
-    
-    # Parameter Types
-    PARAM_RO_SPEC = 237
-    PARAM_AI_SPEC = 240
-    PARAM_RO_REPORT_SPEC = 239
-    PARAM_TAG_REPORT_DATA = 241
-    PARAM_EPC_DATA = 242
-    PARAM_EPC_96 = 236
-    
-    # LLRP Version
-    LLRP_VERSION = 1
-    
-    def __init__(self, host: str, port: int = 5084, timeout: int = 30, setup_rospec: bool = True):
+    def __init__(self, host: str, port: int = 5084, timeout: int = 30):
         """
         Initialize LLRP client.
         
         Args:
             host: Zebra reader hostname or IP address
-            port: LLRP port (default: 5084, use 5085 for secure/TLS)
-            timeout: Connection timeout in seconds (default: 30)
-            setup_rospec: Whether to attempt ROSpec setup (default: True, required for most readers)
+            port: LLRP port (default: 5084)
+            timeout: Socket timeout in seconds
         """
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.setup_rospec = setup_rospec
         self.socket: Optional[socket.socket] = None
-        self.message_id = 1
         self.connected = False
         self.tag_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
         
     def connect(self) -> bool:
-        """
-        Establish connection to Zebra reader.
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
+        """Connect to the reader and start listening."""
         try:
             logger.info(f"Connecting to Zebra reader at {self.host}:{self.port}")
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(self.timeout)
             self.socket.connect((self.host, self.port))
-            logger.info("Socket connected to Zebra reader")
-            
-            # Wait a moment for connection to stabilize
-            time.sleep(0.2)
-            
-            # Mark as connected
             self.connected = True
-            logger.info("TCP connection established to Zebra reader")
+            logger.info("Connected to Zebra reader")
             
-            # IMPORTANT: Check if reader sends any initial message first
-            # Zebra readers send READER_EVENT_NOTIFICATION (type 63) immediately after connection
-            # This message tells us if the connection was accepted or rejected
-            logger.debug("Checking for initial message from reader...")
-            time.sleep(0.1)
-            initial_msg, is_timeout = self._receive_bytes(10)
-            if initial_msg and len(initial_msg) >= 10:
-                logger.debug("Reader sent initial message - processing...")
-                # Try to read the full message
-                try:
-                    # Parse header (10 bytes)
-                    byte0, byte1 = initial_msg[0], initial_msg[1]
-                    message_type = ((byte0 & 0x03) << 8) | byte1
-                    message_length = struct.unpack('>I', initial_msg[2:6])[0]
-                    
-                    if 10 <= message_length <= 65536:
-                        body_length = message_length - 10
-                        full_msg = initial_msg
-                        if body_length > 0:
-                            body, _ = self._receive_bytes(body_length)
-                            if body:
-                                full_msg = initial_msg + body
-                        
-                        logger.info(f"Reader sent initial message type {message_type}")
-                        
-                        # Process the message and check if connection was accepted
-                        connection_ok = self._parse_message(full_msg)
-                        if not connection_ok:
-                            logger.error("Connection rejected by reader")
-                            return False
-                except Exception as e:
-                    logger.warning(f"Could not parse initial message: {e}")
-                    # Continue anyway - might still work
-            elif not is_timeout:
-                logger.warning("No initial message from reader (connection may have closed)")
-                if not self.connected:
-                    return False
+            # Read and discard the initial READER_EVENT_NOTIFICATION
+            self._read_initial_message()
             
-            # Mandatory LLRP initialization sequence
-            # Zebra readers require proper LLRP session initialization or they close the connection
-            if self.setup_rospec:
-                logger.info("Starting LLRP initialization sequence...")
-                
-                # Step 1: Send GET_READER_CAPABILITIES (mandatory initialization message)
-                try:
-                    logger.debug("Step 1: Sending GET_READER_CAPABILITIES...")
-                    
-                    # Verify connection is still alive before sending
-                    if not self.connected:
-                        logger.error("Connection lost before sending GET_READER_CAPABILITIES")
-                        return False
-                    
-                    self._send_get_reader_capabilities()
-                    
-                    # Wait for response and flush it
-                    time.sleep(0.5)
-                    self._flush_pending_messages()
-                    
-                    if not self.connected:
-                        logger.error("Connection lost after GET_READER_CAPABILITIES")
-                        return False
-                except (ConnectionError, socket.error) as e:
-                    error_str = str(e)
-                    logger.error(f"GET_READER_CAPABILITIES failed - connection issue: {e}")
-                    if "Broken pipe" in error_str or "Connection reset" in error_str or "errno 32" in error_str:
-                        logger.error("=" * 60)
-                        logger.error("CRITICAL: Connection closed immediately by reader!")
-                        logger.error("Most likely causes:")
-                        logger.error("1. Another LLRP client is already connected to this reader")
-                        logger.error("   - Close Zebra's 123RFID Desktop application")
-                        logger.error("   - Close any other instances of this agent")
-                        logger.error("   - Check for other LLRP clients on the network")
-                        logger.error("2. Reader needs to be rebooted to clear stale sessions")
-                        logger.error("   - Go to: http://" + self.host + " > Shutdown > Restart Reader")
-                        logger.error("3. Reader's LLRP port may be in secure mode (use port 5085)")
-                        logger.error("=" * 60)
-                    else:
-                        logger.error("This usually means another LLRP client is connected or the reader rejected the session")
-                    return False
-                except Exception as e:
-                    logger.error(f"GET_READER_CAPABILITIES failed: {e}")
-                    if not self.connected:
-                        return False
-                
-                # Step 2: Clear any existing ROSpecs
-                try:
-                    logger.debug("Step 2: Clearing existing ROSpecs...")
-                    self._clear_existing_rospecs()
-                    time.sleep(0.3)
-                    self._flush_pending_messages()
-                    
-                    if not self.connected:
-                        logger.error("Connection lost during ROSpec cleanup")
-                        return False
-                except Exception as e:
-                    logger.warning(f"Failed to clear ROSpecs: {e}")
-                    if not self.connected:
-                        return False
-                
-                # Step 3: Configure and start ROSpec
-                try:
-                    logger.debug("Step 3: Setting up ROSpec...")
-                    self._setup_rospec()
-                    
-                    # Wait for responses
-                    time.sleep(0.5)
-                    self._flush_pending_messages()
-                    
-                    if not self.connected:
-                        logger.error("Connection lost during ROSpec setup")
-                        return False
-                except ConnectionError:
-                    logger.error("Connection lost during ROSpec setup")
-                    return False
-                except Exception as e:
-                    logger.error(f"ROSpec setup failed: {e}")
-                    if not self.connected:
-                        return False
-                    # Re-raise if connection is still alive but setup failed
-                    raise
-                
-                logger.info("LLRP initialization sequence completed successfully")
-            else:
-                logger.warning("Skipping LLRP setup - reader must be pre-configured")
-                logger.warning("Note: Most readers require explicit ROSpec setup or they will close the connection")
-            
-            # Verify connection is still active
-            if not self.connected:
-                logger.error("Connection lost during setup")
-                return False
-            
-            logger.info("LLRP session established and ready")
             return True
             
-        except socket.timeout:
-            logger.error(f"Connection timeout to {self.host}:{self.port}")
-            self.connected = False
-            if self.socket:
-                self.socket.close()
-                self.socket = None
-            return False
-        except socket.gaierror as e:
-            logger.error(f"DNS resolution failed for {self.host}: {e}")
-            self.connected = False
-            if self.socket:
-                self.socket.close()
-                self.socket = None
-            return False
-        except (socket.error, ConnectionError) as e:
-            logger.error(f"Failed to connect to Zebra reader at {self.host}:{self.port}: {e}")
-            self.connected = False
-            if self.socket:
-                try:
-                    self.socket.close()
-                except:
-                    pass
-                self.socket = None
-            return False
         except Exception as e:
-            logger.error(f"Unexpected error connecting to reader: {e}", exc_info=True)
+            logger.error(f"Failed to connect: {e}")
             self.connected = False
             if self.socket:
                 try:
@@ -271,671 +62,144 @@ class LLRPClient:
             return False
     
     def disconnect(self):
-        """Close connection to Zebra reader."""
+        """Disconnect from the reader."""
         if self.socket:
             try:
-                if self.connected:
-                    self._send_stop_rospec()
                 self.socket.close()
-            except Exception as e:
-                logger.warning(f"Error closing connection: {e}")
-            finally:
-                self.socket = None
-                self.connected = False
-                logger.info("Disconnected from Zebra reader")
+            except:
+                pass
+            self.socket = None
+            self.connected = False
+            logger.info("Disconnected from reader")
     
     def set_tag_callback(self, callback: Callable[[str, Dict[str, Any]], None]):
-        """
-        Set callback function for tag reports.
-        
-        Args:
-            callback: Function that receives (epc_id, tag_data) when tag is detected
-        """
+        """Set callback for when tags are read."""
         self.tag_callback = callback
     
     def listen(self):
-        """
-        Start listening for tag reports in blocking mode.
-        
-        This method will continuously read messages from the reader
-        and process tag reports until an error occurs or connection is lost.
-        """
+        """Listen for tag reports from the reader."""
         if not self.connected or not self.socket:
-            logger.error("Not connected to reader. Call connect() first.")
+            logger.error("Not connected")
             return
         
-        logger.info("Starting to listen for tag reports...")
-        
-        consecutive_errors = 0
-        max_consecutive_errors = 10
-        timeout_count = 0
+        logger.info("Listening for tag reports...")
         
         while self.connected:
             try:
-                # Read LLRP message header (10 bytes)
-                header, is_timeout = self._receive_bytes(10)
-                
-                if is_timeout:
-                    # Timeout is normal when waiting for messages - don't count as error
-                    timeout_count += 1
-                    if timeout_count % 100 == 0:
-                        logger.debug(f"Still waiting for messages... ({timeout_count} timeouts)")
+                # Read message header (10 bytes)
+                header = self._recv_exact(10)
+                if not header:
                     continue
                 
-                # Reset timeout counter when we get data
-                timeout_count = 0
+                # Parse header
+                msg_type = ((header[0] & 0x03) << 8) | header[1]
+                msg_length = struct.unpack('>I', header[2:6])[0]
                 
-                if not header or len(header) < 10:
-                    # This is an actual error (not timeout)
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
-                        self.connected = False
-                        break
-                    if not header:
-                        logger.warning("Connection closed or error reading header")
-                        continue
-                    logger.warning(f"Incomplete header received ({len(header)} bytes, expected 10)")
-                    continue
-                
-                # Reset error counter on successful header read
-                consecutive_errors = 0
-                
-                # Parse header (10 bytes)
-                # Bytes 0-1: Reserved (3 bits) + Version (3 bits) + Message Type (10 bits)
-                # Bytes 2-5: Message Length
-                # Bytes 6-9: Message ID
-                byte0, byte1 = header[0], header[1]
-                version = (byte0 >> 2) & 0x07
-                message_type = ((byte0 & 0x03) << 8) | byte1
-                message_length = struct.unpack('>I', header[2:6])[0]
-                message_id = struct.unpack('>I', header[6:10])[0]
-                
-                # Validate message length (minimum 10 bytes for header)
-                if message_length < 10 or message_length > 65536:
-                    logger.debug(f"Invalid message length: {message_length} (type: {message_type}, id: {message_id}). Attempting to resync...")
-                    # Try to resync by discarding a byte and trying again
-                    sync_byte, is_timeout = self._receive_bytes(1)
-                    if is_timeout:
-                        continue  # Timeout is normal
-                    if not sync_byte:
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
-                            self.connected = False
-                            break
-                    continue
-                
-                # Read the rest of the message body (we already have 10 bytes of header)
-                body_length = message_length - 10
+                # Read body
+                body_length = msg_length - 10
+                body = b''
                 if body_length > 0:
-                    message_body, is_timeout = self._receive_bytes(body_length)
-                    if is_timeout:
-                        logger.warning(f"Timeout reading message body (expected {body_length} bytes)")
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
-                            self.connected = False
-                            break
+                    body = self._recv_exact(body_length)
+                    if not body:
                         continue
-                    if not message_body or len(message_body) < body_length:
-                        logger.warning(f"Incomplete message body (expected {body_length}, got {len(message_body) if message_body else 0})")
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection may be lost.")
-                            self.connected = False
-                            break
-                        continue
-                    full_message = header + message_body
-                else:
-                    full_message = header
                 
-                # Parse and process the message
-                self._parse_message(full_message)
-                
+                # Handle RO_ACCESS_REPORT (tag reads)
+                if msg_type == self.MSG_RO_ACCESS_REPORT:
+                    self._handle_tag_report(body)
+                    
             except socket.timeout:
-                # Timeout is expected when waiting for messages, continue listening
-                continue
-            except socket.error as e:
-                logger.error(f"Socket error while listening: {e}")
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error(f"Too many consecutive errors ({consecutive_errors}). Connection lost.")
-                    self.connected = False
-                    break
-                time.sleep(0.5)  # Brief pause before retrying
-                continue
-            except struct.error as e:
-                logger.error(f"Error unpacking message: {e}")
                 continue
             except Exception as e:
-                logger.error(f"Unexpected error processing message: {e}", exc_info=True)
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error(f"Too many consecutive errors ({consecutive_errors}). Stopping listener.")
-                    self.connected = False
-                    break
-                continue
+                logger.error(f"Error: {e}")
+                self.connected = False
+                break
     
-    def _receive_bytes(self, count: int) -> Tuple[Optional[bytes], bool]:
-        """
-        Receive exact number of bytes from socket.
-        
-        Returns:
-            Tuple of (data bytes, is_timeout)
-            - If data received: (bytes, False)
-            - If timeout: (None, True)
-            - If error: (None, False)
-        """
+    def _recv_exact(self, count: int) -> Optional[bytes]:
+        """Receive exact number of bytes."""
         if not self.socket:
-            return None, False
+            return None
         
         data = b''
         while len(data) < count:
             try:
                 chunk = self.socket.recv(count - len(data))
                 if not chunk:
-                    return None, False  # Connection closed
+                    return None
                 data += chunk
             except socket.timeout:
-                return None, True  # Timeout (normal)
-            except socket.error:
-                return None, False  # Actual error
-        
-        return data, False
+                if data:
+                    continue
+                return None
+            except:
+                return None
+        return data
     
-    
-    def _send_message(self, message_type: int, message_body: bytes = b'') -> int:
-        """
-        Send LLRP message to reader.
-        
-        LLRP Message Header Format (10 bytes total):
-        - Bytes 0-1: Reserved (3 bits) + Version (3 bits) + Message Type (10 bits)
-        - Bytes 2-5: Message Length (32 bits, includes header)
-        - Bytes 6-9: Message ID (32 bits)
-        
-        Args:
-            message_type: LLRP message type (10-bit value)
-            message_body: Message body bytes
-            
-        Returns:
-            Message ID
-            
-        Raises:
-            ConnectionError: If not connected or connection lost
-        """
-        if not self.socket or not self.connected:
-            raise ConnectionError("Not connected to reader")
-        
-        # Double-check socket state before sending
+    def _read_initial_message(self):
+        """Read and discard the initial message from reader."""
         try:
-            self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-        except socket.error:
-            self.connected = False
-            raise ConnectionError("Socket connection lost")
-        
-        msg_id = self.message_id
-        self.message_id += 1
-        
-        # Build LLRP header (10 bytes)
-        # First 2 bytes: reserved (3 bits) + version (3 bits) + message_type (10 bits)
-        # Byte 0: [reserved:3][version:3][msg_type_hi:2]
-        # Byte 1: [msg_type_lo:8]
-        reserved = 0
-        version = self.LLRP_VERSION
-        byte0 = ((reserved & 0x07) << 5) | ((version & 0x07) << 2) | ((message_type >> 8) & 0x03)
-        byte1 = message_type & 0xFF
-        
-        # Message length includes the 10-byte header
-        message_length = 10 + len(message_body)
-        
-        # Pack header: 2 bytes (version/type) + 4 bytes (length) + 4 bytes (msg_id)
-        header = struct.pack('>BBII', byte0, byte1, message_length, msg_id)
-        
-        message = header + message_body
-        
-        logger.debug(f"Sending LLRP message: type={message_type}, length={message_length}, id={msg_id}")
-        logger.debug(f"Header bytes: {header.hex()}")
-        
-        try:
-            self.socket.sendall(message)
-            logger.debug(f"Sent LLRP message type {message_type}, ID {msg_id}")
-            return msg_id
-        except socket.timeout:
-            logger.error(f"Timeout sending message type {message_type}")
-            self.connected = False
-            raise ConnectionError("Connection timeout")
-        except socket.error as e:
-            error_code = e.args[0] if e.args else None
-            error_str = str(e)
-            logger.error(f"Socket error sending message: {error_str} (code: {error_code})")
-            self.connected = False
-            if error_code == 32 or "Broken pipe" in error_str or "Connection reset" in error_str:
-                raise ConnectionError("Connection closed by reader - likely another LLRP session is active")
-            raise ConnectionError(f"Connection lost: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error sending message: {e}")
-            raise
+            self.socket.settimeout(2)
+            header = self._recv_exact(10)
+            if header and len(header) >= 10:
+                msg_length = struct.unpack('>I', header[2:6])[0]
+                body_length = msg_length - 10
+                if body_length > 0:
+                    self._recv_exact(body_length)
+                logger.info("Received initial message from reader")
+        except:
+            pass
+        finally:
+            self.socket.settimeout(self.timeout)
     
-    def _parse_message(self, data: bytes) -> bool:
-        """
-        Parse incoming LLRP message.
+    def _handle_tag_report(self, body: bytes):
+        """Extract EPC IDs from tag report."""
+        if not body or not self.tag_callback:
+            return
         
-        LLRP Message Header Format (10 bytes):
-        - Bytes 0-1: Reserved (3 bits) + Version (3 bits) + Message Type (10 bits)
-        - Bytes 2-5: Message Length (32 bits)
-        - Bytes 6-9: Message ID (32 bits)
-        
-        Returns:
-            True if connection should continue, False if connection was rejected
-        """
-        if len(data) < 10:
-            return True
-        
-        # Parse header (10 bytes)
-        byte0, byte1 = data[0], data[1]
-        version = (byte0 >> 2) & 0x07
-        message_type = ((byte0 & 0x03) << 8) | byte1
-        message_length = struct.unpack('>I', data[2:6])[0]
-        message_id = struct.unpack('>I', data[6:10])[0]
-        
-        body = data[10:] if len(data) > 10 else b''
-        
-        # Log all message types for debugging
-        if message_type == self.MSG_RO_ACCESS_REPORT:
-            logger.debug(f"Received RO_ACCESS_REPORT message, ID {message_id}")
-        elif message_type == self.MSG_READER_EVENT_NOTIFICATION:
-            logger.info(f"Received READER_EVENT_NOTIFICATION, ID {message_id}")
-            return self._handle_reader_event_notification(body)
-        elif message_type in [self.MSG_ADD_ROSPEC_RESPONSE, self.MSG_ENABLE_ROSPEC_RESPONSE, 
-                              self.MSG_START_ROSPEC_RESPONSE, self.MSG_GET_READER_CAPABILITIES_RESPONSE]:
-            logger.debug(f"Received response message type {message_type}, ID {message_id}")
-        else:
-            logger.debug(f"Received LLRP message type {message_type}, ID {message_id}")
-        
-        # Handle RO_ACCESS_REPORT (tag reports)
-        if message_type == self.MSG_RO_ACCESS_REPORT:
-            self._handle_ro_access_report(body)
-        
-        return True
-    
-    def _handle_reader_event_notification(self, body: bytes) -> bool:
-        """
-        Handle READER_EVENT_NOTIFICATION message.
-        
-        This message is sent by the reader immediately after connection to indicate
-        whether the connection was accepted or rejected.
-        
-        Returns:
-            True if connection is accepted, False if rejected
-        """
-        # READER_EVENT_NOTIFICATION contains ReaderEventNotificationData parameter
-        # which contains ConnectionAttemptEvent with status
-        # Parameter type 246 = ReaderEventNotificationData
-        # Sub-parameter type 256 = ConnectionAttemptEvent
-        
-        logger.debug(f"READER_EVENT_NOTIFICATION body ({len(body)} bytes): {body.hex()}")
-        
-        if len(body) < 4:
-            logger.warning("READER_EVENT_NOTIFICATION body too short")
-            return True  # Assume success
-        
-        # Parse the nested parameter structure
-        # Body starts with ReaderEventNotificationData (type 246 = 0x00F6)
-        # Which contains ReaderEventNotificationData (type 128 = 0x0080) with timestamp
-        # And ConnectionAttemptEvent (type 256 = 0x0100) with status
-        
+        # Parse TLV parameters looking for EPC data
         offset = 0
         while offset < len(body) - 4:
-            param_type = struct.unpack('>H', body[offset:offset+2])[0]
-            param_length = struct.unpack('>H', body[offset+2:offset+4])[0]
-            
-            logger.debug(f"Parameter at offset {offset}: type={param_type} (0x{param_type:04x}), length={param_length}")
-            
-            if param_type == 256:  # ConnectionAttemptEvent
-                # ConnectionAttemptEvent format: Type(2) + Length(2) + Status(2)
-                if param_length >= 6 and offset + param_length <= len(body):
-                    status = struct.unpack('>H', body[offset+4:offset+6])[0]
-                    logger.info(f"ConnectionAttemptEvent status: {status} (0x{status:04x})")
-                    
-                    # Only reject if status explicitly indicates failure
-                    # Status 0 = Success, others might be informational
-                    if status == 0:
-                        logger.info("Connection accepted by reader (status 0 = Success)")
-                        return True
-                    elif status in [1, 3, 4]:  # Known failure statuses
-                        return self._handle_connection_attempt_status(status)
-                    else:
-                        # Status 2 or other unknown - log but continue
-                        # Some readers may send status 2 even when accepting connections
-                        logger.warning(f"ConnectionAttemptEvent has status {status} - continuing anyway")
-                        logger.warning("If connection fails, this may indicate a configuration issue")
-                        return True
-            
-            # Move to next parameter
-            if param_length >= 4 and param_length <= len(body):
-                offset += param_length
-            else:
-                logger.warning(f"Invalid parameter length {param_length} at offset {offset}, stopping parse")
-                break
-        
-        # If we didn't find ConnectionAttemptEvent, check if status 2 is being reported incorrectly
-        # The hex shows: ...010000060002 at the end
-        # Let's check if status 2 really means rejection
-        logger.warning("No ConnectionAttemptEvent found in expected format")
-        logger.warning(f"Full body hex dump: {body.hex()}")
-        
-        # Actually, looking at the hex: ...010000060002
-        # The last 2 bytes are 0002 = status 2
-        # But wait - that's already what we found. The issue might be that status 2 doesn't actually mean rejection
-        # in the way we think. Let me check if this is actually a success message with status 0
-        # and we're misreading something.
-        
-        # For now, if we can't parse it properly, let's assume success and continue
-        logger.info("Assuming connection accepted (could not parse ConnectionAttemptEvent)")
-        return True
-    
-    def _handle_connection_attempt_status(self, status: int) -> bool:
-        """
-        Handle ConnectionAttemptEvent status.
-        
-        Status codes:
-        - 0: Success
-        - 1: Failed (other reason)
-        - 2: Failed (reader-initiated connection not supported)
-        - 3: Failed (another connection already active)
-        - 4: Failed (reader busy)
-        
-        Returns:
-            True if connection accepted, False if rejected
-        """
-        if status == self.CONN_SUCCESS:
-            logger.info("Connection accepted by reader (status: Success)")
-            return True
-        elif status == self.CONN_FAILED_ANOTHER_CONNECTION_ATTEMPTED:
-            logger.error("=" * 60)
-            logger.error("CONNECTION REJECTED: Another LLRP client is already connected!")
-            logger.error("The reader only allows ONE active LLRP session at a time.")
-            logger.error("")
-            logger.error("To fix this:")
-            logger.error("1. Close any other LLRP clients (Zebra 123RFID Desktop, etc.)")
-            logger.error("2. Close other instances of this agent")
-            logger.error("3. Reboot the reader to clear stale sessions:")
-            logger.error(f"   http://{self.host} > Shutdown > Restart Reader")
-            logger.error("=" * 60)
-            self.connected = False
-            return False
-        elif status == self.CONN_FAILED_READER_BUSY:
-            logger.error("CONNECTION REJECTED: Reader is busy")
-            logger.error("Wait a moment and try again, or reboot the reader")
-            self.connected = False
-            return False
-        elif status == self.CONN_FAILED_OTHER:
-            logger.error("CONNECTION REJECTED: Failed for unspecified reason")
-            self.connected = False
-            return False
-        elif status == self.CONN_FAILED_READER_INITIATED_NOT_SUPPORTED:
-            logger.error("=" * 60)
-            logger.error("CONNECTION REJECTED: Reader does not accept client connections!")
-            logger.error("")
-            logger.error("The reader is configured in 'Reader-Initiated' mode, which means")
-            logger.error("it only makes outbound connections to a configured client IP.")
-            logger.error("")
-            logger.error("To fix this, reconfigure the reader:")
-            logger.error(f"1. Open: http://{self.host}")
-            logger.error("2. Go to: Communication > LLRP Settings")
-            logger.error("3. Change 'Connection Type' from 'Reader Initiated' to 'Client Initiated'")
-            logger.error("   (or 'Initiator: Reader' to 'Initiator: Client')")
-            logger.error("4. Save and apply the settings")
-            logger.error("5. Reboot the reader if required")
-            logger.error("=" * 60)
-            self.connected = False
-            return False
-        else:
-            logger.warning(f"Unknown connection attempt status: {status}")
-            return True  # Assume success for unknown statuses
-
-    def _handle_ro_access_report(self, body: bytes):
-        """Parse RO_ACCESS_REPORT message to extract tag data."""
-        offset = 0
-        
-        # Parse TagReportData parameters
-        while offset < len(body):
-            if offset + 2 > len(body):
-                break
-            
-            param_type = struct.unpack('>H', body[offset:offset+2])[0]
-            param_length = struct.unpack('>H', body[offset+2:offset+4])[0] if offset + 4 <= len(body) else 0
-            
-            if param_type == self.PARAM_TAG_REPORT_DATA:
-                # Extract EPC from TagReportData
-                tag_data = body[offset:offset+param_length]
-                epc_id = self._extract_epc_from_tag_report(tag_data)
+            try:
+                param_type = struct.unpack('>H', body[offset:offset+2])[0]
+                param_length = struct.unpack('>H', body[offset+2:offset+4])[0]
                 
-                if epc_id and self.tag_callback:
-                    tag_info = {
-                        'timestamp': time.time(),
-                        'epc_id': epc_id
-                    }
-                    self.tag_callback(epc_id, tag_info)
-            
-            if param_length > 0:
+                if param_length < 4:
+                    break
+                
+                # TagReportData contains the EPC
+                if param_type == 241:  # TagReportData
+                    epc = self._extract_epc(body[offset:offset+param_length])
+                    if epc:
+                        self.tag_callback(epc, {'timestamp': time.time()})
+                
                 offset += param_length
-            else:
+            except:
                 break
     
-    def _extract_epc_from_tag_report(self, tag_data: bytes) -> Optional[str]:
-        """Extract EPC ID from TagReportData parameter."""
-        offset = 0
+    def _extract_epc(self, data: bytes) -> Optional[str]:
+        """Extract EPC hex string from TagReportData."""
+        # Look for EPC-96 parameter (type 13 as TV parameter = 0x8D)
+        for i in range(len(data) - 14):
+            if data[i] == 0x8D:  # TV parameter type 13 (EPC-96)
+                # EPC-96: 1 byte type + 2 bytes EPC length info + 12 bytes EPC
+                epc_bytes = data[i+3:i+15]
+                if len(epc_bytes) == 12:
+                    return epc_bytes.hex().upper()
         
-        # TagReportData contains EPC parameter
-        while offset < len(tag_data):
-            if offset + 2 > len(tag_data):
-                break
-            
-            param_type = struct.unpack('>H', tag_data[offset:offset+2])[0]
-            
-            if param_type == self.PARAM_EPC_DATA or param_type == self.PARAM_EPC_96:
-                # EPC-96 format: 12 bytes (96 bits)
-                if offset + 16 <= len(tag_data):
-                    epc_bytes = tag_data[offset+4:offset+16]
-                    # Convert to hex string
-                    epc_hex = ''.join(f'{b:02X}' for b in epc_bytes)
-                    return epc_hex
-            
-            if offset + 4 <= len(tag_data):
-                param_length = struct.unpack('>H', tag_data[offset+2:offset+4])[0]
-                if param_length > 0:
-                    offset += param_length
-                else:
+        # Alternative: look for EPCData TLV (type 241)
+        offset = 4  # Skip TagReportData header
+        while offset < len(data) - 4:
+            try:
+                p_type = struct.unpack('>H', data[offset:offset+2])[0]
+                p_len = struct.unpack('>H', data[offset+2:offset+4])[0]
+                
+                if p_type == 241 and p_len >= 16:  # EPCData
+                    epc_bytes = data[offset+6:offset+18]
+                    return epc_bytes.hex().upper()
+                
+                if p_len < 4:
                     break
-            else:
+                offset += p_len
+            except:
                 break
         
         return None
-    
-    def _send_get_reader_capabilities(self):
-        """Send GET_READER_CAPABILITIES message."""
-        self._send_message(self.MSG_GET_READER_CAPABILITIES)
-    
-    def _clear_existing_rospecs(self):
-        """
-        Clear any existing ROSpecs on the reader.
-        
-        This prevents conflicts when adding a new ROSpec.
-        """
-        try:
-            if not self.connected:
-                raise ConnectionError("Not connected")
-            
-            # Try to get existing ROSpecs first (optional - may fail if none exist)
-            try:
-                logger.debug("Checking for existing ROSpecs...")
-                self._send_message(self.MSG_GET_ROSPECS)
-                time.sleep(0.2)
-            except:
-                pass  # Ignore errors - reader may not have any ROSpecs
-            
-            # Delete ROSpec with ID 1 (the one we'll create)
-            # Note: This may fail if ROSpec 1 doesn't exist, which is fine
-            try:
-                logger.debug("Attempting to delete existing ROSpec ID 1...")
-                delete_body = struct.pack('>I', 1)  # ROSpec ID
-                self._send_message(self.MSG_DELETE_ROSPEC, delete_body)
-                time.sleep(0.2)
-            except Exception as e:
-                logger.debug(f"DELETE_ROSPEC may have failed (ROSpec may not exist): {e}")
-            
-        except Exception as e:
-            logger.warning(f"Error clearing ROSpecs: {e}")
-            # Don't raise - continue anyway
-    
-    def _setup_rospec(self):
-        """
-        Configure ROSpec for tag reporting.
-        
-        This method implements the mandatory LLRP sequence:
-        1. ADD_ROSPEC - Define the read operation specification
-        2. ENABLE_ROSPEC - Enable the ROSpec
-        3. START_ROSPEC - Start the read operation
-        
-        Most Zebra readers require this explicit setup or they will close the LLRP session.
-        """
-        try:
-            if not self.connected:
-                raise ConnectionError("Not connected")
-            
-            # Build ROSpec body (simplified)
-            # ROSpec ID = 1, Priority = 0, State = Disabled
-            rospec_body = struct.pack('>I', 1)  # ROSpec ID
-            rospec_body += struct.pack('>B', 0)  # Priority
-            rospec_body += struct.pack('>B', 0)  # CurrentState (0 = Disabled)
-            
-            # AISpec (Antenna Inventory Spec)
-            aispec = self._build_aispec()
-            rospec_body += aispec
-            
-            # ROReportSpec
-            roreportspec = self._build_roreportspec()
-            rospec_body += roreportspec
-            
-            # Send ADD_ROSPEC
-            if not self.connected:
-                raise ConnectionError("Connection lost before ADD_ROSPEC")
-            param_header = struct.pack('>HH', self.PARAM_RO_SPEC, len(rospec_body) + 4)
-            self._send_message(self.MSG_ADD_ROSPEC, param_header + rospec_body)
-            time.sleep(0.1)  # Brief delay between messages
-            
-            # Enable ROSpec
-            if not self.connected:
-                raise ConnectionError("Connection lost before ENABLE_ROSPEC")
-            enable_body = struct.pack('>I', 1)  # ROSpec ID
-            self._send_message(self.MSG_ENABLE_ROSPEC, enable_body)
-            time.sleep(0.1)
-            
-            # Start ROSpec
-            if not self.connected:
-                raise ConnectionError("Connection lost before START_ROSPEC")
-            start_body = struct.pack('>I', 1)  # ROSpec ID
-            self._send_message(self.MSG_START_ROSPEC, start_body)
-            
-            logger.info("ROSpec configured and started")
-            
-        except ConnectionError as e:
-            logger.warning(f"Connection lost during ROSpec setup: {e}")
-            raise  # Re-raise to allow caller to handle
-        except Exception as e:
-            logger.warning(f"Failed to setup ROSpec (reader may already be configured): {e}")
-            # Don't raise - allow connection to continue
-    
-    def _build_aispec(self) -> bytes:
-        """Build AISpec parameter."""
-        # Simplified AISpec - all antennas, continuous inventory
-        aispec_body = struct.pack('>H', 0)  # AntennaIDs count (0 = all)
-        aispec_body += struct.pack('>I', 0)  # AISpecStopTrigger (0 = null)
-        aispec_body += struct.pack('>I', 0)  # InventoryParameterSpecID
-        aispec_body += struct.pack('>HH', 0, 0)  # ProtocolID (0 = EPCGlobal Class1 Gen2)
-        
-        param_length = 4 + len(aispec_body)
-        return struct.pack('>HH', self.PARAM_AI_SPEC, param_length) + aispec_body
-    
-    def _build_roreportspec(self) -> bytes:
-        """Build ROReportSpec parameter."""
-        # Configure to report on all tag reads
-        roreportspec_body = struct.pack('>I', 0)  # ROReportTrigger (0 = Upon_See_RO_Access_Report)
-        roreportspec_body += struct.pack('>H', 0)  # N (0 = report all)
-        roreportspec_body += struct.pack('>B', 1)  # TagReportContentSelector (include EPC)
-        
-        param_length = 4 + len(roreportspec_body)
-        return struct.pack('>HH', self.PARAM_RO_REPORT_SPEC, param_length) + roreportspec_body
-    
-    def _flush_pending_messages(self, timeout: float = 1.0):
-        """
-        Read and discard any pending messages in the socket buffer.
-        
-        This is useful after sending setup messages to clear response messages
-        before starting to listen for tag reports.
-        
-        Args:
-            timeout: Maximum time to spend flushing messages
-        """
-        if not self.socket:
-            return
-        
-        original_timeout = self.socket.gettimeout()
-        self.socket.settimeout(0.1)  # Short timeout for flushing
-        
-        end_time = time.time() + timeout
-        messages_read = 0
-        
-        try:
-            while time.time() < end_time:
-                try:
-                    # Try to read a header (10 bytes)
-                    header, is_timeout = self._receive_bytes(10)
-                    if is_timeout or not header or len(header) < 10:
-                        break
-                    
-                    # Parse header to get message length (bytes 2-5)
-                    message_length = struct.unpack('>I', header[2:6])[0]
-                    
-                    # Validate and read full message
-                    if 10 <= message_length <= 65536:
-                        body_length = message_length - 10
-                        if body_length > 0:
-                            body, is_timeout = self._receive_bytes(body_length)
-                            if is_timeout or not body or len(body) < body_length:
-                                break
-                        messages_read += 1
-                        
-                        # Parse and log the message type
-                        byte0, byte1 = header[0], header[1]
-                        message_type = ((byte0 & 0x03) << 8) | byte1
-                        logger.debug(f"Flushed pending message type {message_type}")
-                    else:
-                        # Invalid message, stop flushing
-                        break
-                except socket.timeout:
-                    break
-                except Exception as e:
-                    logger.debug(f"Error flushing message: {e}")
-                    break
-        finally:
-            self.socket.settimeout(original_timeout)
-        
-        if messages_read > 0:
-            logger.debug(f"Flushed {messages_read} pending message(s)")
-    
-    def _send_stop_rospec(self):
-        """Stop and disable ROSpec."""
-        try:
-            # Stop ROSpec
-            stop_body = struct.pack('>I', 1)  # ROSpec ID
-            self._send_message(self.MSG_STOP_ROSPEC, stop_body)
-            
-            # Disable ROSpec
-            disable_body = struct.pack('>I', 1)  # ROSpec ID
-            self._send_message(self.MSG_DISABLE_ROSPEC, disable_body)
-        except Exception as e:
-            logger.warning(f"Failed to stop ROSpec: {e}")
-
