@@ -95,22 +95,28 @@ class LLRPClient:
             # Some LLRP readers send a message immediately after connection
             logger.debug("Checking for initial message from reader...")
             time.sleep(0.1)
-            initial_msg, is_timeout = self._receive_bytes(12)
-            if initial_msg and len(initial_msg) >= 12:
+            initial_msg, is_timeout = self._receive_bytes(10)
+            if initial_msg and len(initial_msg) >= 10:
                 logger.debug("Reader sent initial message - processing...")
                 # Try to read the full message
                 try:
-                    message_length = struct.unpack('>I', initial_msg[4:8])[0]
-                    if 12 <= message_length <= 65536:
-                        body_length = message_length - 12
+                    # Parse header (10 bytes)
+                    byte0, byte1 = initial_msg[0], initial_msg[1]
+                    message_type = ((byte0 & 0x03) << 8) | byte1
+                    message_length = struct.unpack('>I', initial_msg[2:6])[0]
+                    
+                    if 10 <= message_length <= 65536:
+                        body_length = message_length - 10
                         if body_length > 0:
                             body, _ = self._receive_bytes(body_length)
                             if body:
                                 full_msg = initial_msg + body
-                                message_type = int.from_bytes(initial_msg[1:4], byteorder='big')
                                 logger.info(f"Reader sent initial message type {message_type}")
                                 # Process the message (might be error or status)
                                 self._parse_message(full_msg)
+                        else:
+                            logger.info(f"Reader sent initial message type {message_type} (no body)")
+                            self._parse_message(initial_msg)
                 except Exception as e:
                     logger.debug(f"Could not parse initial message: {e}")
                     # Continue anyway
@@ -292,8 +298,8 @@ class LLRPClient:
         
         while self.connected:
             try:
-                # Read LLRP message header (12 bytes: version + type + length + id)
-                header, is_timeout = self._receive_bytes(12)
+                # Read LLRP message header (10 bytes)
+                header, is_timeout = self._receive_bytes(10)
                 
                 if is_timeout:
                     # Timeout is normal when waiting for messages - don't count as error
@@ -305,7 +311,7 @@ class LLRPClient:
                 # Reset timeout counter when we get data
                 timeout_count = 0
                 
-                if not header or len(header) < 12:
+                if not header or len(header) < 10:
                     # This is an actual error (not timeout)
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
@@ -315,23 +321,26 @@ class LLRPClient:
                     if not header:
                         logger.warning("Connection closed or error reading header")
                         continue
-                    logger.warning(f"Incomplete header received ({len(header)} bytes, expected 12)")
+                    logger.warning(f"Incomplete header received ({len(header)} bytes, expected 10)")
                     continue
                 
                 # Reset error counter on successful header read
                 consecutive_errors = 0
                 
-                # Parse header to get message length (bytes 4-8)
-                version = header[0] & 0x3F
-                message_type = int.from_bytes(header[1:4], byteorder='big')
-                message_length = struct.unpack('>I', header[4:8])[0]
-                message_id = struct.unpack('>I', header[8:12])[0]
+                # Parse header (10 bytes)
+                # Bytes 0-1: Reserved (3 bits) + Version (3 bits) + Message Type (10 bits)
+                # Bytes 2-5: Message Length
+                # Bytes 6-9: Message ID
+                byte0, byte1 = header[0], header[1]
+                version = (byte0 >> 2) & 0x07
+                message_type = ((byte0 & 0x03) << 8) | byte1
+                message_length = struct.unpack('>I', header[2:6])[0]
+                message_id = struct.unpack('>I', header[6:10])[0]
                 
-                # Validate message length
-                if message_length < 12 or message_length > 65536:
+                # Validate message length (minimum 10 bytes for header)
+                if message_length < 10 or message_length > 65536:
                     logger.debug(f"Invalid message length: {message_length} (type: {message_type}, id: {message_id}). Attempting to resync...")
-                    # Try to resync by looking for a valid header pattern
-                    # Discard first byte and try again
+                    # Try to resync by discarding a byte and trying again
                     sync_byte, is_timeout = self._receive_bytes(1)
                     if is_timeout:
                         continue  # Timeout is normal
@@ -343,8 +352,8 @@ class LLRPClient:
                             break
                     continue
                 
-                # Read the rest of the message body (we already have 12 bytes of header)
-                body_length = message_length - 12
+                # Read the rest of the message body (we already have 10 bytes of header)
+                body_length = message_length - 10
                 if body_length > 0:
                     message_body, is_timeout = self._receive_bytes(body_length)
                     if is_timeout:
@@ -426,8 +435,13 @@ class LLRPClient:
         """
         Send LLRP message to reader.
         
+        LLRP Message Header Format (10 bytes total):
+        - Bytes 0-1: Reserved (3 bits) + Version (3 bits) + Message Type (10 bits)
+        - Bytes 2-5: Message Length (32 bits, includes header)
+        - Bytes 6-9: Message ID (32 bits)
+        
         Args:
-            message_type: LLRP message type
+            message_type: LLRP message type (10-bit value)
             message_body: Message body bytes
             
         Returns:
@@ -441,7 +455,6 @@ class LLRPClient:
         
         # Double-check socket state before sending
         try:
-            # Use getsockopt to check if socket is still connected
             self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
         except socket.error:
             self.connected = False
@@ -450,14 +463,25 @@ class LLRPClient:
         msg_id = self.message_id
         self.message_id += 1
         
-        # LLRP message header: version (1 byte), message_type (3 bytes), message_length (4 bytes), message_id (4 bytes)
-        version_byte = self.LLRP_VERSION & 0x3F  # 6 bits
-        message_type_bytes = message_type.to_bytes(3, byteorder='big')
+        # Build LLRP header (10 bytes)
+        # First 2 bytes: reserved (3 bits) + version (3 bits) + message_type (10 bits)
+        # Byte 0: [reserved:3][version:3][msg_type_hi:2]
+        # Byte 1: [msg_type_lo:8]
+        reserved = 0
+        version = self.LLRP_VERSION
+        byte0 = ((reserved & 0x07) << 5) | ((version & 0x07) << 2) | ((message_type >> 8) & 0x03)
+        byte1 = message_type & 0xFF
         
-        message_length = 12 + len(message_body)  # Header (12 bytes) + body
-        header = struct.pack('>B', version_byte) + message_type_bytes + struct.pack('>II', message_length, msg_id)
+        # Message length includes the 10-byte header
+        message_length = 10 + len(message_body)
+        
+        # Pack header: 2 bytes (version/type) + 4 bytes (length) + 4 bytes (msg_id)
+        header = struct.pack('>BBII', byte0, byte1, message_length, msg_id)
         
         message = header + message_body
+        
+        logger.debug(f"Sending LLRP message: type={message_type}, length={message_length}, id={msg_id}")
+        logger.debug(f"Header bytes: {header.hex()}")
         
         try:
             self.socket.sendall(message)
@@ -480,17 +504,25 @@ class LLRPClient:
             raise
     
     def _parse_message(self, data: bytes):
-        """Parse incoming LLRP message."""
-        if len(data) < 12:
+        """
+        Parse incoming LLRP message.
+        
+        LLRP Message Header Format (10 bytes):
+        - Bytes 0-1: Reserved (3 bits) + Version (3 bits) + Message Type (10 bits)
+        - Bytes 2-5: Message Length (32 bits)
+        - Bytes 6-9: Message ID (32 bits)
+        """
+        if len(data) < 10:
             return
         
-        # Parse header
-        version = data[0] & 0x3F
-        message_type = int.from_bytes(data[1:4], byteorder='big')
-        message_length = struct.unpack('>I', data[4:8])[0]
-        message_id = struct.unpack('>I', data[8:12])[0]
+        # Parse header (10 bytes)
+        byte0, byte1 = data[0], data[1]
+        version = (byte0 >> 2) & 0x07
+        message_type = ((byte0 & 0x03) << 8) | byte1
+        message_length = struct.unpack('>I', data[2:6])[0]
+        message_id = struct.unpack('>I', data[6:10])[0]
         
-        body = data[12:] if len(data) > 12 else b''
+        body = data[10:] if len(data) > 10 else b''
         
         # Log all message types for debugging
         if message_type == self.MSG_RO_ACCESS_REPORT:
@@ -704,17 +736,17 @@ class LLRPClient:
         try:
             while time.time() < end_time:
                 try:
-                    # Try to read a header
-                    header, is_timeout = self._receive_bytes(12)
-                    if is_timeout or not header or len(header) < 12:
+                    # Try to read a header (10 bytes)
+                    header, is_timeout = self._receive_bytes(10)
+                    if is_timeout or not header or len(header) < 10:
                         break
                     
-                    # Get message length
-                    message_length = struct.unpack('>I', header[4:8])[0]
+                    # Parse header to get message length (bytes 2-5)
+                    message_length = struct.unpack('>I', header[2:6])[0]
                     
                     # Validate and read full message
-                    if 12 <= message_length <= 65536:
-                        body_length = message_length - 12
+                    if 10 <= message_length <= 65536:
+                        body_length = message_length - 10
                         if body_length > 0:
                             body, is_timeout = self._receive_bytes(body_length)
                             if is_timeout or not body or len(body) < body_length:
@@ -722,7 +754,8 @@ class LLRPClient:
                         messages_read += 1
                         
                         # Parse and log the message type
-                        message_type = int.from_bytes(header[1:4], byteorder='big')
+                        byte0, byte1 = header[0], header[1]
+                        message_type = ((byte0 & 0x03) << 8) | byte1
                         logger.debug(f"Flushed pending message type {message_type}")
                     else:
                         # Invalid message, stop flushing
