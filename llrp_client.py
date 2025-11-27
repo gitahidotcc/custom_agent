@@ -574,49 +574,37 @@ class LLRPClient:
         # Parameter type 246 = ReaderEventNotificationData
         # Sub-parameter type 256 = ConnectionAttemptEvent
         
+        logger.debug(f"READER_EVENT_NOTIFICATION body ({len(body)} bytes): {body.hex()}")
+        
         if len(body) < 4:
             logger.warning("READER_EVENT_NOTIFICATION body too short")
             return True  # Assume success
         
-        offset = 0
-        while offset < len(body) - 4:
-            # Read parameter header (Type-Length)
-            param_type = struct.unpack('>H', body[offset:offset+2])[0]
-            param_length = struct.unpack('>H', body[offset+2:offset+4])[0]
-            
-            logger.debug(f"ReaderEventNotification parameter: type={param_type}, length={param_length}")
-            
-            # Check for ConnectionAttemptEvent (type 256) embedded within
-            # It could be directly in body or nested in ReaderEventNotificationData (246)
-            param_data = body[offset+4:offset+param_length] if param_length > 4 else b''
-            
-            # Look for ConnectionAttemptEvent in the parameter data
-            inner_offset = 0
-            while inner_offset < len(param_data) - 4:
-                inner_type = struct.unpack('>H', param_data[inner_offset:inner_offset+2])[0]
-                inner_length = struct.unpack('>H', param_data[inner_offset+2:inner_offset+4])[0]
-                
-                logger.debug(f"  Inner parameter: type={inner_type}, length={inner_length}")
-                
-                # ConnectionAttemptEvent type = 256
-                if inner_type == 256:
-                    # ConnectionAttemptEvent contains a single status byte
-                    if inner_length >= 6:  # 4 bytes header + 2 bytes status
-                        status = struct.unpack('>H', param_data[inner_offset+4:inner_offset+6])[0]
-                        return self._handle_connection_attempt_status(status)
-                
-                if inner_length > 0:
-                    inner_offset += inner_length
-                else:
-                    break
-            
-            if param_length > 0:
-                offset += param_length
-            else:
-                break
+        # Search entire body for ConnectionAttemptEvent (type 256 = 0x0100)
+        # The event is nested inside ReaderEventNotificationData
+        # Format: Type (2 bytes) + Length (2 bytes) + Status (2 bytes)
         
-        # If we didn't find ConnectionAttemptEvent, assume success
-        logger.debug("No ConnectionAttemptEvent found in READER_EVENT_NOTIFICATION")
+        # Look for the byte pattern 0x01 0x00 which indicates type 256
+        for i in range(len(body) - 5):
+            # Check for TLV parameter type 256 (0x0100)
+            if body[i] == 0x01 and body[i+1] == 0x00:
+                # Found potential ConnectionAttemptEvent
+                param_length = struct.unpack('>H', body[i+2:i+4])[0]
+                logger.debug(f"Found potential ConnectionAttemptEvent at offset {i}, length={param_length}")
+                
+                if param_length >= 6 and i + param_length <= len(body):
+                    # Extract status (2 bytes after type and length)
+                    status = struct.unpack('>H', body[i+4:i+6])[0]
+                    logger.info(f"ConnectionAttemptEvent status: {status}")
+                    return self._handle_connection_attempt_status(status)
+        
+        # Also check for TV-encoded ConnectionAttemptEvent
+        # TV parameters have high bit set: 1xxxxxxx type, then value
+        # ConnectionAttemptEvent as TV would be: 0x80 | (256 & 0x7F) = not possible since 256 > 127
+        
+        # If we didn't find ConnectionAttemptEvent, log the body for debugging and assume success
+        logger.info("No ConnectionAttemptEvent found - assuming connection accepted")
+        logger.debug(f"Full body hex dump: {body.hex()}")
         return True
     
     def _handle_connection_attempt_status(self, status: int) -> bool:

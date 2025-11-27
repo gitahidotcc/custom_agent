@@ -12,7 +12,7 @@ locations:
   warehouse:  114 
 
 logging:
-  level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+  level: "DEBUG"  # Options: DEBUG, INFO, WARNING, ERROR (temporarily set to DEBUG for troubleshooting)
   file: "logs/agent.log"
   unknown_tags_file: "logs/unknown_tags.log"
 
